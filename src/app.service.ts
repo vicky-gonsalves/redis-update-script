@@ -1,31 +1,33 @@
 import {
   Injectable,
+  InternalServerErrorException,
   Logger,
   NotFoundException,
+  OnApplicationShutdown,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createClient, createCluster } from 'redis';
 
 @Injectable()
-export class AppService {
+export class AppService implements OnApplicationShutdown {
   private readonly logger = new Logger();
   private clientConfig;
   private readonly url: string;
   private readonly password: string;
-  private cluster;
+  private static cluster;
 
   constructor(private readonly configService: ConfigService) {
     this.url = this.configService.get<string>('REDIS_URL');
     this.password = this.configService.get<string>('REDIS_PASS');
 
     if (this.configService.get<string>('ENV') === 'development') {
-      this.cluster = createClient({
+      AppService.cluster = createClient({
         url: this.url,
         password: this.password,
       });
     } else {
-      this.cluster = createCluster({
+      AppService.cluster = createCluster({
         rootNodes: [
           {
             url: this.url,
@@ -37,26 +39,26 @@ export class AppService {
         },
       });
     }
-    this.cluster.on('error', (err) => {
+    AppService.cluster.on('error', (err) => {
       this.logger.error('Redis Cluster Error, shutting down application', err);
       process.exit(1);
     });
+
+    AppService.cluster.connect();
   }
 
   private async fetch(key: string) {
-    this.clientConfig = await this.cluster.json.get(key);
+    this.clientConfig = await AppService.cluster.json.get(key);
     this.logger.log('Fetch Client Config From Redis Successful');
     this.logger.log(this.clientConfig);
     if (!this.clientConfig) {
       return new NotFoundException(`key ${key} not found`);
     }
-    this.cluster.disconnect();
     return this.clientConfig;
   }
 
   async getKey(key: string) {
     try {
-      await this.cluster.connect();
       return this.fetch(key);
     } catch (err) {
       this.logger.error('Fetch Client Config From Redis Failed', err);
@@ -66,12 +68,21 @@ export class AppService {
 
   async updateKey(key: string, value) {
     try {
-      await this.cluster.connect();
-      await this.cluster.json.set(key, '$', value);
-      return this.fetch(key);
+      await AppService.cluster.json.set(key, '$', value);
     } catch (err) {
-      this.logger.error('Fetch Client Config From Redis Failed', err);
-      return new UnprocessableEntityException('Fetch Client Config From Redis Failed');
+      this.logger.error('Update Client Config to Redis Failed', err);
+      return new UnprocessableEntityException('Update Client Config to Redis Failed');
     }
+    try {
+      await AppService.cluster.publish(key, JSON.stringify(value));
+    } catch (err) {
+      this.logger.error('publish failed', err);
+      return new InternalServerErrorException('publish failed');
+    }
+    return this.fetch(key);
+  }
+
+  onApplicationShutdown() {
+    AppService.cluster.disconnect();
   }
 }
